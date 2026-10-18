@@ -1,0 +1,200 @@
+Usage
+bash
+
+node angular-ast-scan.js --src ./src --tsconfig ./tsconfig.json --out ./arch-report
+
+Flags
+Flag	Default	Description
+--src <dir>	./src	Source root to scan
+--tsconfig <file>	./tsconfig.json	tsconfig for path mapping and compiler options. Important — this is how path aliases (@app/*) resolve
+--out <dir>	./arch-report	Output directory
+--include-tests	off	Include *.spec.ts files
+--max-nodes <n>	5000	Safety cap on nodes per graph
+--mermaid-max <n>	150	Max nodes rendered in a single Mermaid diagram (JSON always has the full graph)
+--fail-on <csv>	—	Exit non-zero if the named checks find issues. Keys: httpOutsideRoot, repeatedShared, duplicateSingletons, leakyRoot, forFeatureWithoutRoot
+Example — CI gate
+bash
+
+node angular-ast-scan.js \
+  --src ./src \
+  --tsconfig ./tsconfig.json \
+  --out ./arch-report \
+  --fail-on httpOutsideRoot,forFeatureWithoutRoot
+
+This fails the build (exit code 2) if HttpClientModule is imported outside AppModule or if any forFeature runs without a visible forRoot — catching provider-scoping regressions before merge.
+Example — scan a single large feature
+
+For very large src/, you can split the scan and merge reports:
+bash
+
+node angular-ast-scan.js --src ./src/app/feature-orders --out ./arch/orders
+node angular-ast-scan.js --src ./src/app/feature-billing --out ./arch/billing
+
+Each architecture-model.json is a plain map of nodes/edges and can be merged.
+Reading the report cold — 10-minute onboarding path
+
+    Open ARCHITECTURE-REPORT.md §8 — the ordered start guide.
+
+    graphs/modules.mmd — see how NgModules wire up. Locate AppModule; follow its imports to CoreModule and SharedModule; then to feature modules.
+
+    graphs/routing.mmd — every arrow leaving a routing file is a business feature. Pick one and read its feature module next.
+
+    graphs/services.mmd — follow arrows into a service to see its consumers; arrows out to see its collaborators.
+
+    graphs/api.mmd — filter by a feature file to see exactly which endpoints that feature touches.
+
+    graphs/ngrx.mmd — confirm forRoot runs before any forFeature.
+
+Section 9 of the report documents exactly what the scanner cannot prove — always read it before trusting a graph for a high-risk change.
+How it works (short version)
+
+    Loads tsconfig.json via ts.parseJsonConfigFileContent and creates a ts.Program over all .ts files in --src.
+
+    Walks the AST once to classify every class by its decorator: @NgModule, @Component, @Directive, @Pipe, @Injectable.
+
+    For NgModules, extracts declarations/imports/exports/providers and resolves each entry through the compiler's symbol table (checker.getSymbolAtLocation → checker.getAliasedSymbol → ts.resolveModuleName). This is what makes aliases and re-exports work.
+
+    For routing files, detects RouterModule.forRoot/forChild and extracts loadChildren/loadComponent targets from arrow callbacks.
+
+    For components, reads templateUrl (from disk) or inline template and matches tag selectors against the declared-component selector registry.
+
+    For injectables, walks constructor parameter type references and resolves each to its declaring file.
+
+    For API calls, detects HttpClient method calls and extracts verb + URL.
+
+    For NgRx, greps for StoreModule.*, EffectsModule.*, createAction, createReducer, createSelector.
+
+    Emits Markdown + JSON + six .mmd files.
+
+Limitations — read before relying on the output
+
+Static analysis of Angular is heuristic, not proof. The scanner is explicit about what it cannot do:
+
+    Dynamic import(expr) — imports with computed strings cannot be resolved; flagged [VERIFY].
+
+    Runtime-generated routes — router.navigate targets, route guards returning to constructed URLs, and route configs built in code cannot be mapped statically.
+
+    Interceptor execution order — the scanner inventories interceptors (G4) but the actual HTTP chain at runtime depends on HTTP_INTERCEPTORS provider order in the root module.
+
+    Template analysis — tag selectors match well; attribute selectors, ngComponentOutlet, ng-template content projection, and structural directives need manual review.
+
+    API URLs composed at runtime — http.get(\base/orders/base/orders/{id}`)` is flagged dynamic.
+
+    Business flows — which API feeds which state, which state feeds which UI, and which UI action triggers which effect — requires reading NgRx effects/reducers by hand or running the application. The scanner is a map, not a trace.
+
+    Path aliases — resolved only if tsconfig.json paths are configured and passed via --tsconfig. Otherwise they show as ?:name edges with [VERIFY].
+
+If you need business-flow reconstruction, this is the wrong tool — that requires either runtime tracing (OpenTelemetry, Angular DevTools) or manual code reading of NgRx effects and component reducers.
+CI integration
+GitHub Actions
+yaml
+
+name: Architecture Scan
+on: [pull_request]
+
+jobs:
+  arch-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '18' }
+      - run: npm ci
+      - run: npm install --no-save typescript@4.9
+      - run: node angular-ast-scan.js --src ./src --out ./arch-report --fail-on httpOutsideRoot,forFeatureWithoutRoot
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arch-report
+          path: arch-report/
+
+The uploaded artifact contains the report, the JSON model, and the six Mermaid files — attachable to a PR, reviewable by any reviewer.
+GitLab CI
+yaml
+
+arch-scan:
+  image: node:18
+  script:
+    - npm ci
+    - npm install --no-save typescript@4.9
+    - node angular-ast-scan.js --src ./src --out ./arch-report --fail-on httpOutsideRoot,forFeatureWithoutRoot
+  artifacts:
+    when: always
+    paths:
+      - arch-report/
+
+Rendering the Mermaid diagrams
+
+The .mmd files are plain Mermaid. Open them in any of:
+
+    VS Code — install Markdown Preview Mermaid Support or Mermaid Preview
+
+    GitHub — paste the fenced block into a Markdown file
+
+    mermaid.live — paste and export as PNG/SVG
+
+    mmdc CLI — batch export:
+    bash
+
+    npx @mermaid-js/mermaid-cli -i graphs/modules.mmd -o graphs/modules.svg
+
+Report structure reference
+Section	Content
+§1	Inventory — counts of every artefact class
+§2	G1 — module graph, forRoot/forFeature, leak risks, repeated imports, duplicate singletons, HttpClient outside root
+§3	G2 — routing graph and lazy boundaries
+§4	G3 — component graph
+§5	G4 — service graph and classification
+§6	G5 — API call graph
+§7	G6 — NgRx graph
+§8	Ordered "start here" guide for a new developer
+§9	Known limitations — what the scanner cannot prove
+Exit codes
+Code	Meaning
+0	Scan completed, no --fail-on checks triggered
+1	Fatal error (source not found, TypeScript program failed to load)
+2	One or more --fail-on checks triggered
+Version compatibility
+Angular	TypeScript to install	Notes
+13	typescript@4.9	Target version — full support
+14	typescript@4.8	Standalone components supported
+15	typescript@4.9	Standalone components supported
+16+	typescript@5.x	Works; standalone components inventoried
+FAQ
+
+Does it modify my source?
+No. It reads files only and writes outputs to --out.
+
+Does it run my application?
+No. It does not start Angular, Node, or any server. It only parses .ts files.
+
+Will it work on an src/ with 2,000 files?
+Yes. TypeScript's Program is built for repositories of this scale. If parsing takes too long, use --src on a single top-level feature folder and merge the resulting architecture-model.json files.
+
+Why does it need --tsconfig?
+To resolve path aliases (@app/core/*) and to match the project's module resolution strategy. Without it, alias imports show as ?:name with [VERIFY] tags instead of resolved file edges.
+
+Can it reconstruct business flows?
+No. It reconstructs declared dependencies and architectural relationships. Business flows (API → state → UI sequencing) require runtime tracing or manual reading of NgRx effects and reducers.
+
+Can I extend it?
+Yes. The script is a single file with clearly separated "passes" (Pass 1–7). Each pass adds edges to a graph object (G.modules, G.routing, etc.). Add a pass or a check, add a Mermaid render call, and it appears in the report.
+License
+
+MIT — use freely inside your organisation. Attribution appreciated but not required.
+Acknowledgements
+
+Built on the TypeScript Compiler API. Symbol resolution patterns inspired by the Angular compiler's own NgtscProgram symbol walk, simplified for static architectural purposes only.
+text
+
+
+---
+
+**Notes on the README**
+
+- **Structure** — what → why → outputs → graphs → checks → install → use → reading path → how it works → limitations → CI → rendering → reference → FAQ. That's the natural order a new reader consumes documentation.
+- **Every finding tag** is explained once (`[CONFIRMED]` / `[INFERRED]` / `[VERIFY]`) and reinforced at the point of use, so a reader doesn't need to scroll back.
+- **The limitations section is deliberately blunt** — for a tool that will be used during high-risk changes, underselling its weaknesses would be irresponsible.
+- **CI examples are copy-paste-ready** for both GitHub and GitLab — the two most common enterprise setups.
+- **Version compatibility table** prevents the most common deployment failure (mismatched TypeScript on an Angular 13 project).
+- **FAQ addresses the questions a tech lead will actually ask** before approving a static scanner in their repo: does it touch my code, will it scale, and can it actually give me business flows.
